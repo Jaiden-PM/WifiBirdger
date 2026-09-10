@@ -26,18 +26,23 @@ import (
 const (
 	appName        = "WiFiEthernetBridge"
 	taskName       = "WiFi to Ethernet Bridge"
-	currentVersion = "1.2.0"
-	githubRepo     = "KanadeBlue/WifiBirdger"
+	currentVersion = "1.3.3"
+	githubRepo     = "Jaiden-PM/WifiBirdger"
 
-	WM_CREATE         = 0x0001
-	WM_DESTROY        = 0x0002
-	WM_COMMAND        = 0x0111
-	WM_TIMER          = 0x0113
-	WM_CLOSE          = 0x0010
-	WM_SETFONT        = 0x0030
-	WM_CTLCOLORSTATIC = 0x0138
-	WM_CTLCOLOREDIT   = 0x0133
-	WM_APP_UPDATE     = 0x8001
+	WM_CREATE          = 0x0001
+	WM_DESTROY         = 0x0002
+	WM_PAINT           = 0x000F
+	WM_ERASEBKGND      = 0x0014
+	WM_DRAWITEM        = 0x002B
+	WM_COMMAND         = 0x0111
+	WM_TIMER           = 0x0113
+	WM_CLOSE           = 0x0010
+	WM_SETFONT         = 0x0030
+	WM_CTLCOLORSTATIC  = 0x0138
+	WM_CTLCOLOREDIT    = 0x0133
+	WM_CTLCOLORLISTBOX = 0x0134
+	WM_CTLCOLORBTN     = 0x0135
+	WM_APP_UPDATE      = 0x8001
 
 	WS_OVERLAPPED  = 0x00000000
 	WS_CAPTION     = 0x00C00000
@@ -51,6 +56,8 @@ const (
 
 	BS_PUSHBUTTON    = 0x00000000
 	BS_AUTOCHECKBOX  = 0x00000003
+	BS_OWNERDRAW     = 0x0000000B
+	BS_FLAT          = 0x00008000
 	ES_LEFT          = 0x0000
 	ES_MULTILINE     = 0x0004
 	ES_AUTOVSCROLL   = 0x0040
@@ -62,6 +69,12 @@ const (
 	CW_USEDEFAULT    = ^uintptr(0x7fffffff)
 	COLOR_WINDOW     = 5
 	DEFAULT_GUI_FONT = 17
+	HOLLOW_BRUSH     = 5
+	FW_NORMAL        = 400
+	FW_SEMIBOLD      = 600
+	FW_BOLD          = 700
+	TRANSPARENT      = 1
+	PS_SOLID         = 0
 	IDI_APPLICATION  = 32512
 	IDC_ARROW        = 32512
 
@@ -81,7 +94,11 @@ const (
 	EM_SETSEL     = 0x00B1
 	EM_REPLACESEL = 0x00C2
 
-	BN_CLICKED = 0
+	BN_CLICKED    = 0
+	ODS_SELECTED  = 0x0001
+	DT_CENTER     = 0x00000001
+	DT_VCENTER    = 0x00000004
+	DT_SINGLELINE = 0x00000020
 
 	ID_WIFI         = 1001
 	ID_ETHERNET     = 1002
@@ -102,6 +119,26 @@ const (
 )
 
 type POINT struct{ X, Y int32 }
+type RECT struct{ Left, Top, Right, Bottom int32 }
+type PAINTSTRUCT struct {
+	Hdc         syscall.Handle
+	FErase      int32
+	RcPaint     RECT
+	FRestore    int32
+	FIncUpdate  int32
+	RgbReserved [32]byte
+}
+type DRAWITEMSTRUCT struct {
+	CtlType    uint32
+	CtlID      uint32
+	ItemID     uint32
+	ItemAction uint32
+	ItemState  uint32
+	HwndItem   syscall.Handle
+	HDC        syscall.Handle
+	RcItem     RECT
+	ItemData   uintptr
+}
 type MSG struct {
 	Hwnd    syscall.Handle
 	Message uint32
@@ -175,6 +212,8 @@ var (
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
 	gdi32    = syscall.NewLazyDLL("gdi32.dll")
 	shell32  = syscall.NewLazyDLL("shell32.dll")
+	dwmapi   = syscall.NewLazyDLL("dwmapi.dll")
+	uxtheme  = syscall.NewLazyDLL("uxtheme.dll")
 
 	procCreateWindowExW     = user32.NewProc("CreateWindowExW")
 	procDefWindowProcW      = user32.NewProc("DefWindowProcW")
@@ -195,36 +234,69 @@ var (
 	procGetWindowTextLength = user32.NewProc("GetWindowTextLengthW")
 	procSetTimer            = user32.NewProc("SetTimer")
 	procKillTimer           = user32.NewProc("KillTimer")
+	procBeginPaint          = user32.NewProc("BeginPaint")
+	procEndPaint            = user32.NewProc("EndPaint")
+	procInvalidateRect      = user32.NewProc("InvalidateRect")
 
-	procGetModuleHandle  = kernel32.NewProc("GetModuleHandleW")
-	procGetStockObject   = gdi32.NewProc("GetStockObject")
-	procCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
-	procSetBkColor       = gdi32.NewProc("SetBkColor")
-	procSetTextColor     = gdi32.NewProc("SetTextColor")
-	procShellExecute     = shell32.NewProc("ShellExecuteW")
-	procIsUserAnAdmin    = shell32.NewProc("IsUserAnAdmin")
+	procGetModuleHandle       = kernel32.NewProc("GetModuleHandleW")
+	procGetStockObject        = gdi32.NewProc("GetStockObject")
+	procCreateSolidBrush      = gdi32.NewProc("CreateSolidBrush")
+	procCreatePen             = gdi32.NewProc("CreatePen")
+	procCreateFont            = gdi32.NewProc("CreateFontW")
+	procSelectObject          = gdi32.NewProc("SelectObject")
+	procDeleteObject          = gdi32.NewProc("DeleteObject")
+	procRoundRect             = gdi32.NewProc("RoundRect")
+	procRectangle             = gdi32.NewProc("Rectangle")
+	procSetBkColor            = gdi32.NewProc("SetBkColor")
+	procSetBkMode             = gdi32.NewProc("SetBkMode")
+	procSetTextColor          = gdi32.NewProc("SetTextColor")
+	procDrawText              = user32.NewProc("DrawTextW")
+	procShellExecute          = shell32.NewProc("ShellExecuteW")
+	procIsUserAnAdmin         = shell32.NewProc("IsUserAnAdmin")
+	procDwmSetWindowAttribute = dwmapi.NewProc("DwmSetWindowAttribute")
+	procSetWindowTheme        = uxtheme.NewProc("SetWindowTheme")
 
-	hwndMain      syscall.Handle
-	hWiFi         syscall.Handle
-	hEthernet     syscall.Handle
-	hAutoDetect   syscall.Handle
-	hAutoStart    syscall.Handle
-	hRefresh      syscall.Handle
-	hStart        syscall.Handle
-	hRepair       syscall.Handle
-	hStop         syscall.Handle
-	hStatus       syscall.Handle
-	hLog          syscall.Handle
-	hAutoUpdate   syscall.Handle
-	hCheckUpdate  syscall.Handle
-	hUpdateStatus syscall.Handle
+	hwndMain        syscall.Handle
+	hWiFi           syscall.Handle
+	hEthernet       syscall.Handle
+	hAutoDetect     syscall.Handle
+	hAutoStart      syscall.Handle
+	hRefresh        syscall.Handle
+	hStart          syscall.Handle
+	hRepair         syscall.Handle
+	hStop           syscall.Handle
+	hStatus         syscall.Handle
+	hHealthTitle    syscall.Handle
+	hWiFiMetric     syscall.Handle
+	hEthernetMetric syscall.Handle
+	hShareMetric    syscall.Handle
+	hLog            syscall.Handle
+	hAutoUpdate     syscall.Handle
+	hCheckUpdate    syscall.Handle
+	hUpdateStatus   syscall.Handle
+	hSubtitle       syscall.Handle
+	hVersion        syscall.Handle
+	hSectionNetwork syscall.Handle
+	hSectionUpdates syscall.Handle
+	hSectionLog     syscall.Handle
 
 	uiQueue = make(chan func(), 64)
 	opMu    sync.Mutex
 	busy    bool
 
-	darkBrush syscall.Handle
-	editBrush syscall.Handle
+	darkBrush     syscall.Handle
+	editBrush     syscall.Handle
+	cardBrush     syscall.Handle
+	softBrush     syscall.Handle
+	borderPen     syscall.Handle
+	hFontTitle    syscall.Handle
+	hFontHero     syscall.Handle
+	hFontSection  syscall.Handle
+	hFontBody     syscall.Handle
+	hFontSmall    syscall.Handle
+	hFontMono     syscall.Handle
+	lastHealth    Health
+	lastHealthErr error
 )
 
 func utf16(s string) *uint16 {
@@ -1028,6 +1100,134 @@ func setAutoStart(enable bool, cfg Config) error {
 	return nil
 }
 
+func rgb(r, g, b byte) uintptr { return uintptr(r) | uintptr(g)<<8 | uintptr(b)<<16 }
+
+func makeFont(height int32, weight int32, face string) syscall.Handle {
+	h, _, _ := procCreateFont.Call(
+		uintptr(height), 0, 0, 0, uintptr(weight), 0, 0, 0,
+		1, 0, 0, 5, 0, uintptr(unsafe.Pointer(utf16(face))),
+	)
+	return syscall.Handle(h)
+}
+
+func applyFont(hwnd syscall.Handle, font syscall.Handle) {
+	if hwnd != 0 && font != 0 {
+		procSendMessage.Call(uintptr(hwnd), WM_SETFONT, uintptr(font), 1)
+	}
+}
+
+func enableDarkTitleBar(hwnd syscall.Handle) {
+	var enabled int32 = 1
+	procDwmSetWindowAttribute.Call(uintptr(hwnd), 20, uintptr(unsafe.Pointer(&enabled)), unsafe.Sizeof(enabled))
+}
+
+func darkTheme(hwnd syscall.Handle) {
+	if hwnd != 0 {
+		procSetWindowTheme.Call(uintptr(hwnd), uintptr(unsafe.Pointer(utf16("DarkMode_Explorer"))), 0)
+	}
+}
+
+func drawRoundedPanel(hdc syscall.Handle, r RECT, fill uintptr, border uintptr, radius int32) {
+	brush, _, _ := procCreateSolidBrush.Call(fill)
+	pen, _, _ := procCreatePen.Call(PS_SOLID, 1, border)
+	oldBrush, _, _ := procSelectObject.Call(uintptr(hdc), brush)
+	oldPen, _, _ := procSelectObject.Call(uintptr(hdc), pen)
+	procRoundRect.Call(uintptr(hdc), uintptr(r.Left), uintptr(r.Top), uintptr(r.Right), uintptr(r.Bottom), uintptr(radius), uintptr(radius))
+	procSelectObject.Call(uintptr(hdc), oldBrush)
+	procSelectObject.Call(uintptr(hdc), oldPen)
+	procDeleteObject.Call(brush)
+	procDeleteObject.Call(pen)
+}
+
+func paintDashboard(hwnd syscall.Handle) {
+	var ps PAINTSTRUCT
+	hdc, _, _ := procBeginPaint.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps)))
+	if hdc == 0 {
+		return
+	}
+	defer procEndPaint.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps)))
+
+	bg := rgb(12, 17, 24)
+	card := rgb(20, 27, 37)
+	card2 := rgb(17, 24, 33)
+	border := rgb(42, 52, 65)
+	accent := rgb(73, 139, 255)
+
+	bgBrush, _, _ := procCreateSolidBrush.Call(bg)
+	old, _, _ := procSelectObject.Call(hdc, bgBrush)
+	procRectangle.Call(hdc, 0, 0, 920, 760)
+	procSelectObject.Call(hdc, old)
+	procDeleteObject.Call(bgBrush)
+
+	// Brand mark.
+	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 24, Right: 70, Bottom: 66}, accent, accent, 12)
+	procSetBkMode.Call(hdc, TRANSPARENT)
+	procSetTextColor.Call(hdc, rgb(255, 255, 255))
+	oldFont, _, _ := procSelectObject.Call(hdc, uintptr(hFontSection))
+	logo := utf16("WB")
+	rcLogo := RECT{Left: 28, Top: 24, Right: 70, Bottom: 66}
+	procDrawText.Call(hdc, uintptr(unsafe.Pointer(logo)), ^uintptr(0), uintptr(unsafe.Pointer(&rcLogo)), DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	procSelectObject.Call(hdc, oldFont)
+
+	// Main dashboard cards.
+	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 92, Right: 892, Bottom: 210}, card, border, 18)
+	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 240, Right: 892, Bottom: 404}, card2, border, 18)
+	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 434, Right: 892, Bottom: 544}, card2, border, 18)
+	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 574, Right: 892, Bottom: 716}, card2, border, 18)
+
+	// Metric dividers inside the health card.
+	pen, _, _ := procCreatePen.Call(PS_SOLID, 1, rgb(38, 48, 61))
+	oldPen, _, _ := procSelectObject.Call(hdc, pen)
+	procRectangle.Call(hdc, 502, 118, 503, 184)
+	procRectangle.Call(hdc, 627, 118, 628, 184)
+	procRectangle.Call(hdc, 752, 118, 753, 184)
+	procSelectObject.Call(hdc, oldPen)
+	procDeleteObject.Call(pen)
+}
+
+func drawModernButton(dis *DRAWITEMSTRUCT) {
+	if dis == nil {
+		return
+	}
+	id := int(dis.CtlID)
+	fill := rgb(31, 41, 54)
+	border := rgb(52, 64, 80)
+	textColor := rgb(236, 241, 248)
+
+	switch id {
+	case ID_START:
+		fill = rgb(61, 126, 240)
+		border = rgb(80, 145, 255)
+	case ID_STOP:
+		fill = rgb(92, 38, 45)
+		border = rgb(132, 55, 66)
+	case ID_CHECKUPDATE:
+		fill = rgb(37, 83, 155)
+		border = rgb(53, 105, 190)
+	}
+	if dis.ItemState&ODS_SELECTED != 0 {
+		fill = rgb(byte(fill&0xff)*4/5, byte((fill>>8)&0xff)*4/5, byte((fill>>16)&0xff)*4/5)
+	}
+
+	drawRoundedPanel(dis.HDC, dis.RcItem, fill, border, 10)
+	procSetBkMode.Call(uintptr(dis.HDC), TRANSPARENT)
+	procSetTextColor.Call(uintptr(dis.HDC), textColor)
+	oldFont, _, _ := procSelectObject.Call(uintptr(dis.HDC), uintptr(hFontBody))
+	buf := make([]uint16, 128)
+	procGetWindowText.Call(uintptr(dis.HwndItem), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	text := syscall.UTF16ToString(buf)
+	p := utf16(text)
+	r := dis.RcItem
+	procDrawText.Call(uintptr(dis.HDC), uintptr(unsafe.Pointer(p)), ^uintptr(0), uintptr(unsafe.Pointer(&r)), DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	procSelectObject.Call(uintptr(dis.HDC), oldFont)
+}
+
+func invalidateDashboard() {
+	if hwndMain != 0 {
+		procInvalidateRect.Call(uintptr(hwndMain), 0, 0)
+	}
+}
+
 func postUI(fn func()) {
 	select {
 	case uiQueue <- fn:
@@ -1260,21 +1460,51 @@ func autoCheckUpdateFromGUI() {
 }
 
 func updateHealthUI(h Health, err error) {
+	lastHealth = h
+	lastHealthErr = err
 	if err != nil {
-		setWindowText(hStatus, "Status: "+err.Error())
+		setWindowText(hHealthTitle, "Needs attention")
+		setWindowText(hStatus, err.Error())
+		setWindowText(hWiFiMetric, "Unavailable")
+		setWindowText(hEthernetMetric, "Unavailable")
+		setWindowText(hShareMetric, "Offline")
+		invalidateDashboard()
 		return
 	}
-	state := "NEEDS REPAIR"
-	if h.Healthy {
-		state = "HEALTHY"
-	}
-	watch := "stopped"
+
+	watch := "Watchdog off"
 	if watcherRunning() {
-		watch = "running"
+		watch = "Watchdog active"
 	}
-	text := fmt.Sprintf("%s   •   Watchdog %s\r\nWi-Fi: %s  %s  %s\r\nEthernet: %s  %s  %s\r\nICS: public=%t/%d   private=%t/%d",
-		state, watch, h.WiFiName, h.WiFiStatus, blankAs(h.WiFiIPv4, "no IPv4"), h.EthernetName, h.EthernetStatus, blankAs(h.EthernetIPv4, "no IPv4"), h.PublicSharingEnabled, h.PublicSharingType, h.PrivateSharingEnabled, h.PrivateSharingType)
-	setWindowText(hStatus, text)
+
+	if h.Healthy {
+		setWindowText(hHealthTitle, "Connected & sharing")
+		setWindowText(hStatus, fmt.Sprintf("Internet is being shared from %s to %s • %s", h.WiFiName, h.EthernetName, watch))
+	} else if strings.EqualFold(h.WiFiStatus, "Up") && !strings.EqualFold(h.EthernetStatus, "Up") {
+		setWindowText(hHealthTitle, "Waiting for Ethernet")
+		setWindowText(hStatus, fmt.Sprintf("Wi-Fi is ready. Connect the Ethernet cable to continue • %s", watch))
+	} else {
+		setWindowText(hHealthTitle, "Needs attention")
+		setWindowText(hStatus, fmt.Sprintf("Sharing is not fully healthy yet • %s", watch))
+	}
+
+	wifiText := h.WiFiStatus
+	if h.WiFiIPv4 != "" {
+		wifiText += "\r\n" + h.WiFiIPv4
+	}
+	ethText := h.EthernetStatus
+	if h.EthernetIPv4 != "" {
+		ethText += "\r\n" + h.EthernetIPv4
+	}
+	shareText := "Not active"
+	if h.PublicSharingEnabled && h.PrivateSharingEnabled {
+		shareText = "ICS active"
+	}
+
+	setWindowText(hWiFiMetric, wifiText)
+	setWindowText(hEthernetMetric, ethText)
+	setWindowText(hShareMetric, shareText)
+	invalidateDashboard()
 }
 func blankAs(s, d string) string {
 	if strings.TrimSpace(s) == "" {
@@ -1294,33 +1524,110 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case WM_CREATE:
 		hwndMain = hwnd
-		createControl("STATIC", "Wi-Fi → Ethernet Bridge", WS_CHILD|WS_VISIBLE, 24, 18, 500, 28, 0)
-		createControl("STATIC", "Share your laptop's Wi-Fi internet through its Ethernet port.", WS_CHILD|WS_VISIBLE, 24, 47, 650, 20, 0)
-		createControl("STATIC", "Wi-Fi adapter", WS_CHILD|WS_VISIBLE, 24, 86, 180, 20, 0)
-		createControl("STATIC", "Ethernet adapter", WS_CHILD|WS_VISIBLE, 389, 86, 180, 20, 0)
-		hWiFi = createControl("COMBOBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST, 24, 108, 330, 180, ID_WIFI)
-		hEthernet = createControl("COMBOBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST, 389, 108, 330, 180, ID_ETHERNET)
-		hAutoDetect = createControl("BUTTON", "Auto-detect adapters", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 24, 151, 180, 24, ID_AUTODETECT)
-		hAutoStart = createControl("BUTTON", "Start automatically with Windows", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 220, 151, 250, 24, ID_AUTOSTART)
-		hRefresh = createControl("BUTTON", "Refresh", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 24, 191, 105, 34, ID_REFRESH)
-		hStart = createControl("BUTTON", "Start Sharing", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 141, 191, 145, 34, ID_START)
-		hRepair = createControl("BUTTON", "Repair", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 298, 191, 105, 34, ID_REPAIR)
-		hStop = createControl("BUTTON", "Stop Sharing", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 415, 191, 145, 34, ID_STOP)
-		createControl("STATIC", "Connection status", WS_CHILD|WS_VISIBLE, 24, 246, 180, 20, 0)
-		hStatus = createControl("STATIC", "Checking…", WS_CHILD|WS_VISIBLE, 24, 268, 695, 78, ID_STATUS)
-		createControl("STATIC", "Updates", WS_CHILD|WS_VISIBLE, 24, 360, 100, 20, 0)
-		createControl("STATIC", fmt.Sprintf("Source: github.com/%s", githubRepo), WS_CHILD|WS_VISIBLE, 24, 382, 360, 20, 0)
-		hAutoUpdate = createControl("BUTTON", "Automatically install updates", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 24, 405, 220, 26, ID_AUTOUPDATE)
-		hCheckUpdate = createControl("BUTTON", "Check Update", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 260, 401, 135, 32, ID_CHECKUPDATE)
-		hUpdateStatus = createControl("STATIC", fmt.Sprintf("v%s • checking…", currentVersion), WS_CHILD|WS_VISIBLE, 410, 406, 309, 24, ID_UPDATESTATUS)
-		createControl("STATIC", "Log", WS_CHILD|WS_VISIBLE, 24, 452, 100, 20, 0)
-		hLog = createControl("EDIT", "", WS_CHILD|WS_VISIBLE|WS_BORDER|WS_VSCROLL|ES_LEFT|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY, 24, 474, 695, 108, ID_LOG)
-		darkBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(0x202020)))
-		editBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(0x181818)))
+		enableDarkTitleBar(hwnd)
+
+		// Typography is created once and reused by all controls.
+		hFontTitle = makeFont(-26, FW_BOLD, "Segoe UI")
+		hFontHero = makeFont(-23, FW_SEMIBOLD, "Segoe UI")
+		hFontSection = makeFont(-16, FW_SEMIBOLD, "Segoe UI")
+		hFontBody = makeFont(-15, FW_NORMAL, "Segoe UI")
+		hFontSmall = makeFont(-13, FW_NORMAL, "Segoe UI")
+		hFontMono = makeFont(-13, FW_NORMAL, "Cascadia Mono")
+
+		// Header.
+		title := createControl("STATIC", "WifiBirdger", WS_CHILD|WS_VISIBLE, 84, 20, 330, 32, 0)
+		applyFont(title, hFontTitle)
+		hSubtitle = createControl("STATIC", "Fast, self-healing Wi-Fi → Ethernet sharing", WS_CHILD|WS_VISIBLE, 85, 52, 520, 20, 0)
+		applyFont(hSubtitle, hFontSmall)
+		hVersion = createControl("STATIC", fmt.Sprintf("v%s", currentVersion), WS_CHILD|WS_VISIBLE, 810, 31, 60, 22, 0)
+		applyFont(hVersion, hFontSmall)
+
+		// Health hero card.
+		hHealthTitle = createControl("STATIC", "Checking connection…", WS_CHILD|WS_VISIBLE, 52, 116, 420, 30, 0)
+		applyFont(hHealthTitle, hFontHero)
+		hStatus = createControl("STATIC", "Reading network state…", WS_CHILD|WS_VISIBLE, 52, 151, 420, 42, ID_STATUS)
+		applyFont(hStatus, hFontSmall)
+
+		metricLabel1 := createControl("STATIC", "WI-FI", WS_CHILD|WS_VISIBLE, 522, 118, 88, 18, 0)
+		metricLabel2 := createControl("STATIC", "ETHERNET", WS_CHILD|WS_VISIBLE, 647, 118, 92, 18, 0)
+		metricLabel3 := createControl("STATIC", "SHARING", WS_CHILD|WS_VISIBLE, 772, 118, 90, 18, 0)
+		applyFont(metricLabel1, hFontSmall)
+		applyFont(metricLabel2, hFontSmall)
+		applyFont(metricLabel3, hFontSmall)
+		hWiFiMetric = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 522, 143, 94, 45, 0)
+		hEthernetMetric = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 647, 143, 94, 45, 0)
+		hShareMetric = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 772, 143, 94, 45, 0)
+		applyFont(hWiFiMetric, hFontSection)
+		applyFont(hEthernetMetric, hFontSection)
+		applyFont(hShareMetric, hFontSection)
+
+		// Network card.
+		hSectionNetwork = createControl("STATIC", "Network", WS_CHILD|WS_VISIBLE, 52, 258, 220, 24, 0)
+		applyFont(hSectionNetwork, hFontSection)
+		wifiLabel := createControl("STATIC", "Internet source", WS_CHILD|WS_VISIBLE, 52, 292, 180, 20, 0)
+		ethLabel := createControl("STATIC", "Share to", WS_CHILD|WS_VISIBLE, 466, 292, 180, 20, 0)
+		applyFont(wifiLabel, hFontSmall)
+		applyFont(ethLabel, hFontSmall)
+		hWiFi = createControl("COMBOBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST, 52, 315, 360, 180, ID_WIFI)
+		hEthernet = createControl("COMBOBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST, 466, 315, 360, 180, ID_ETHERNET)
+		applyFont(hWiFi, hFontBody)
+		applyFont(hEthernet, hFontBody)
+		darkTheme(hWiFi)
+		darkTheme(hEthernet)
+
+		hAutoDetect = createControl("BUTTON", "Auto-detect adapters", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX|BS_FLAT, 52, 358, 190, 24, ID_AUTODETECT)
+		hAutoStart = createControl("BUTTON", "Start with Windows", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX|BS_FLAT, 255, 358, 180, 24, ID_AUTOSTART)
+		applyFont(hAutoDetect, hFontSmall)
+		applyFont(hAutoStart, hFontSmall)
+
+		hRefresh = createControl("BUTTON", "Refresh", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 466, 352, 100, 34, ID_REFRESH)
+		hRepair = createControl("BUTTON", "Repair", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 576, 352, 100, 34, ID_REPAIR)
+		hStop = createControl("BUTTON", "Stop", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 686, 352, 76, 34, ID_STOP)
+		hStart = createControl("BUTTON", "Start sharing", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 772, 352, 96, 34, ID_START)
+		applyFont(hRefresh, hFontBody)
+		applyFont(hRepair, hFontBody)
+		applyFont(hStop, hFontBody)
+		applyFont(hStart, hFontBody)
+
+		// Updates card.
+		hSectionUpdates = createControl("STATIC", "Updates", WS_CHILD|WS_VISIBLE, 52, 452, 150, 22, 0)
+		applyFont(hSectionUpdates, hFontSection)
+		updateSource := createControl("STATIC", fmt.Sprintf("GitHub • %s", githubRepo), WS_CHILD|WS_VISIBLE, 52, 480, 300, 20, 0)
+		applyFont(updateSource, hFontSmall)
+		hUpdateStatus = createControl("STATIC", fmt.Sprintf("v%s • checking…", currentVersion), WS_CHILD|WS_VISIBLE, 355, 480, 285, 20, ID_UPDATESTATUS)
+		applyFont(hUpdateStatus, hFontSmall)
+		hAutoUpdate = createControl("BUTTON", "Install updates automatically", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX|BS_FLAT, 52, 510, 235, 24, ID_AUTOUPDATE)
+		applyFont(hAutoUpdate, hFontSmall)
+		hCheckUpdate = createControl("BUTTON", "Check for update", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 704, 484, 164, 38, ID_CHECKUPDATE)
+		applyFont(hCheckUpdate, hFontBody)
+
+		// Log card.
+		hSectionLog = createControl("STATIC", "Activity", WS_CHILD|WS_VISIBLE, 52, 593, 150, 22, 0)
+		applyFont(hSectionLog, hFontSection)
+		hLog = createControl("EDIT", "", WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_LEFT|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY, 52, 624, 816, 70, ID_LOG)
+		applyFont(hLog, hFontMono)
+		darkTheme(hLog)
+
+		darkBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(rgb(12, 17, 24))))
+		editBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(rgb(15, 21, 29))))
+		cardBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(rgb(20, 27, 37))))
+		softBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(rgb(17, 24, 33))))
+		borderPen = syscall.Handle(mustCall(procCreatePen.Call(PS_SOLID, 1, rgb(42, 52, 65))))
+
 		procSetTimer.Call(uintptr(hwnd), 1, 10000, 0)
 		refreshAdaptersAndStatus()
 		autoCheckUpdateFromGUI()
 		return 0
+
+	case WM_PAINT:
+		paintDashboard(hwnd)
+		return 0
+	case WM_ERASEBKGND:
+		return 1
+	case WM_DRAWITEM:
+		dis := (*DRAWITEMSTRUCT)(unsafe.Pointer(lParam))
+		drawModernButton(dis)
+		return 1
 	case WM_COMMAND:
 		id := int(loWord(wParam))
 		note := hiWord(wParam)
@@ -1385,13 +1692,32 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 			}
 		}
 	case WM_CTLCOLORSTATIC:
-		procSetTextColor.Call(wParam, 0x00F0F0F0)
-		procSetBkColor.Call(wParam, 0x00202020)
-		return uintptr(darkBrush)
-	case WM_CTLCOLOREDIT:
-		procSetTextColor.Call(wParam, 0x00E8E8E8)
-		procSetBkColor.Call(wParam, 0x00181818)
+		procSetBkMode.Call(wParam, TRANSPARENT)
+		color := rgb(222, 229, 238)
+		h := syscall.Handle(lParam)
+		if h == hSubtitle || h == hVersion || h == hStatus || h == hUpdateStatus {
+			color = rgb(137, 151, 169)
+		}
+		if h == hHealthTitle {
+			if lastHealthErr != nil {
+				color = rgb(255, 111, 120)
+			} else if lastHealth.Healthy {
+				color = rgb(93, 211, 158)
+			} else {
+				color = rgb(255, 190, 92)
+			}
+		}
+		procSetTextColor.Call(wParam, color)
+		hollow, _, _ := procGetStockObject.Call(HOLLOW_BRUSH)
+		return hollow
+	case WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX:
+		procSetTextColor.Call(wParam, rgb(232, 238, 246))
+		procSetBkColor.Call(wParam, rgb(15, 21, 29))
 		return uintptr(editBrush)
+	case WM_CTLCOLORBTN:
+		procSetTextColor.Call(wParam, rgb(205, 215, 227))
+		procSetBkColor.Call(wParam, rgb(17, 24, 33))
+		return uintptr(softBrush)
 	case WM_CLOSE:
 		cfg := currentConfigFromUI()
 		_ = saveConfig(cfg)
@@ -1399,6 +1725,11 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		return 0
 	case WM_DESTROY:
 		procKillTimer.Call(uintptr(hwnd), 1)
+		for _, obj := range []syscall.Handle{darkBrush, editBrush, cardBrush, softBrush, borderPen, hFontTitle, hFontHero, hFontSection, hFontBody, hFontSmall, hFontMono} {
+			if obj != 0 {
+				procDeleteObject.Call(uintptr(obj))
+			}
+		}
 		procPostQuitMessage.Call(0)
 		return 0
 	}
@@ -1421,7 +1752,7 @@ func runGUI() {
 		return
 	}
 	style := uint32(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX)
-	hwnd, _, _ := procCreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(utf16("Wi-Fi → Ethernet Bridge"))), uintptr(style), CW_USEDEFAULT, CW_USEDEFAULT, 760, 640, 0, 0, hInst, 0)
+	hwnd, _, _ := procCreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(utf16("WifiBirdger"))), uintptr(style), CW_USEDEFAULT, CW_USEDEFAULT, 920, 760, 0, 0, hInst, 0)
 	if hwnd == 0 {
 		return
 	}
