@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -24,10 +25,9 @@ import (
 )
 
 const (
-	appName        = "WiFiEthernetBridge"
-	taskName       = "WiFi to Ethernet Bridge"
-	currentVersion = "1.3.3"
-	githubRepo     = "Jaiden-PM/WifiBirdger"
+	appName    = "WiFiEthernetBridge"
+	taskName   = "WiFi to Ethernet Bridge"
+	githubRepo = "Jaiden-PM/WifiBirdger"
 
 	WM_CREATE          = 0x0001
 	WM_DESTROY         = 0x0002
@@ -113,10 +113,19 @@ const (
 	ID_AUTOUPDATE   = 1011
 	ID_CHECKUPDATE  = 1012
 	ID_UPDATESTATUS = 1013
+	ID_AUTOREPAIR   = 1014
+	ID_TESTCONN     = 1015
+	ID_COPYDIAG     = 1016
+	ID_OPENSETTINGS = 1017
+	ID_OPENLOG      = 1018
+	ID_CLEARLOG     = 1019
+	ID_TOOLSTATUS   = 1020
 
 	PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 	CREATE_NO_WINDOW                  = 0x08000000
 )
+
+var currentVersion = "1.4.0"
 
 type POINT struct{ X, Y int32 }
 type RECT struct{ Left, Top, Right, Bottom int32 }
@@ -169,6 +178,7 @@ type Config struct {
 	CheckIntervalSeconds  int    `json:"checkIntervalSeconds"`
 	StartupWaitSeconds    int    `json:"startupWaitSeconds"`
 	RepairCooldownSeconds int    `json:"repairCooldownSeconds"`
+	AutoRepair            bool   `json:"autoRepair"`
 	AutoUpdate            bool   `json:"autoUpdate"`
 	UpdateIntervalHours   int    `json:"updateIntervalHours"`
 }
@@ -205,6 +215,26 @@ type Health struct {
 	PrivateSharingEnabled bool
 	PrivateSharingType    int
 	Healthy               bool
+}
+
+type Telemetry struct {
+	SSID              string
+	SignalPercent     int
+	WiFiLinkSpeed     string
+	EthernetLinkSpeed string
+	Gateway           string
+	DNS               string
+	ConnectedDevices  []string
+	PublicIP          string
+}
+
+type ConnectivityResult struct {
+	RouteOK      bool
+	DNSOK        bool
+	HTTPSOK      bool
+	Latency      time.Duration
+	ResolvedHost string
+	PublicIP     string
 }
 
 var (
@@ -277,26 +307,47 @@ var (
 	hSubtitle       syscall.Handle
 	hVersion        syscall.Handle
 	hSectionNetwork syscall.Handle
+	hSectionDetails syscall.Handle
+	hSectionTools   syscall.Handle
 	hSectionUpdates syscall.Handle
 	hSectionLog     syscall.Handle
+	hAutoRepair     syscall.Handle
+	hSSIDValue      syscall.Handle
+	hSignalValue    syscall.Handle
+	hWiFiSpeedValue syscall.Handle
+	hEthSpeedValue  syscall.Handle
+	hDevicesValue   syscall.Handle
+	hPublicIPValue  syscall.Handle
+	hGatewayValue   syscall.Handle
+	hTestConn       syscall.Handle
+	hCopyDiag       syscall.Handle
+	hOpenSettings   syscall.Handle
+	hOpenLog        syscall.Handle
+	hClearLog       syscall.Handle
+	hToolStatus     syscall.Handle
 
 	uiQueue = make(chan func(), 64)
 	opMu    sync.Mutex
 	busy    bool
 
-	darkBrush     syscall.Handle
-	editBrush     syscall.Handle
-	cardBrush     syscall.Handle
-	softBrush     syscall.Handle
-	borderPen     syscall.Handle
-	hFontTitle    syscall.Handle
-	hFontHero     syscall.Handle
-	hFontSection  syscall.Handle
-	hFontBody     syscall.Handle
-	hFontSmall    syscall.Handle
-	hFontMono     syscall.Handle
-	lastHealth    Health
-	lastHealthErr error
+	darkBrush        syscall.Handle
+	editBrush        syscall.Handle
+	cardBrush        syscall.Handle
+	softBrush        syscall.Handle
+	borderPen        syscall.Handle
+	hFontTitle       syscall.Handle
+	hFontHero        syscall.Handle
+	hFontSection     syscall.Handle
+	hFontBody        syscall.Handle
+	hFontSmall       syscall.Handle
+	hFontMono        syscall.Handle
+	lastHealth       Health
+	lastHealthErr    error
+	lastTelemetry    Telemetry
+	lastTelemetryErr error
+	publicIPMu       sync.Mutex
+	publicIPCache    string
+	publicIPAt       time.Time
 )
 
 func utf16(s string) *uint16 {
@@ -323,7 +374,7 @@ func defaultConfig() Config {
 	return Config{
 		WiFi: "Wi-Fi", Ethernet: "Ethernet", AutoDetect: true,
 		CheckIntervalSeconds: 15, StartupWaitSeconds: 120, RepairCooldownSeconds: 20,
-		AutoUpdate: true, UpdateIntervalHours: 6,
+		AutoRepair: true, AutoUpdate: true, UpdateIntervalHours: 6,
 	}
 }
 
@@ -512,6 +563,268 @@ $healthy=($wifi.Status -eq "Up" -and [bool]$wifiIp -and [bool]$route -and $pubEn
 		PublicSharingEnabled: boolVal(m, "PublicSharingEnabled"), PublicSharingType: intVal(m, "PublicSharingType"),
 		PrivateSharingEnabled: boolVal(m, "PrivateSharingEnabled"), PrivateSharingType: intVal(m, "PrivateSharingType"), Healthy: boolVal(m, "Healthy"),
 	}, nil
+}
+
+func telemetry(cfg Config) (Telemetry, error) {
+	wifi, eth, err := discover(cfg)
+	if err != nil {
+		return Telemetry{}, err
+	}
+
+	script := fmt.Sprintf(`
+$ErrorActionPreference = "Stop"
+$wifiName = %s
+$ethName = %s
+$wifi = Get-NetAdapter -Name $wifiName -ErrorAction Stop
+$eth = Get-NetAdapter -Name $ethName -ErrorAction Stop
+
+$profile = Get-NetConnectionProfile -InterfaceIndex $wifi.ifIndex -ErrorAction SilentlyContinue | Select-Object -First 1
+$ssid = if ($profile) { [string]$profile.Name } else { "" }
+$signal = 0
+try {
+  foreach ($line in @(netsh wlan show interfaces 2>$null)) {
+    if ($line -match '^\s*Signal\s*:\s*(\d+)%%') {
+      $signal = [int]$matches[1]
+      break
+    }
+  }
+} catch {}
+
+$ipcfg = Get-NetIPConfiguration -InterfaceIndex $wifi.ifIndex -ErrorAction SilentlyContinue
+$gateway = if ($ipcfg -and $ipcfg.IPv4DefaultGateway) { [string]$ipcfg.IPv4DefaultGateway.NextHop } else { "" }
+$dns = @(Get-DnsClientServerAddress -InterfaceIndex $wifi.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses -join ", "
+
+$ethIp = Get-NetIPAddress -InterfaceIndex $eth.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object { $_.IPAddress -notlike "169.254.*" } |
+  Select-Object -First 1
+$localEth = if ($ethIp) { [string]$ethIp.IPAddress } else { "" }
+
+$devices = @(
+  Get-NetNeighbor -InterfaceIndex $eth.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object {
+    $_.State -in @("Reachable","Stale","Delay","Probe","Permanent") -and
+    $_.IPAddress -ne $localEth -and
+    $_.IPAddress -ne "0.0.0.0" -and
+    $_.IPAddress -notlike "224.*" -and
+    $_.IPAddress -notlike "239.*" -and
+    $_.IPAddress -notlike "255.*" -and
+    $_.LinkLayerAddress -and
+    $_.LinkLayerAddress -ne "00-00-00-00-00-00" -and
+    $_.LinkLayerAddress -ne "FF-FF-FF-FF-FF-FF"
+  } |
+  Select-Object -ExpandProperty IPAddress -Unique
+)
+
+"SSID=$ssid"
+"SignalPercent=$signal"
+"WiFiLinkSpeed=$($wifi.LinkSpeed)"
+"EthernetLinkSpeed=$($eth.LinkSpeed)"
+"Gateway=$gateway"
+"DNS=$dns"
+"ConnectedDevices=$($devices -join '|')"
+`, psQuote(wifi), psQuote(eth))
+
+	out, err := runPowerShell(script)
+	if err != nil {
+		return Telemetry{}, err
+	}
+
+	values := map[string]string{}
+	for _, line := range strings.Split(strings.ReplaceAll(out, "\r\n", "\n"), "\n") {
+		if i := strings.Index(line, "="); i > 0 {
+			values[line[:i]] = strings.TrimSpace(line[i+1:])
+		}
+	}
+
+	signal, _ := strconv.Atoi(values["SignalPercent"])
+	var devices []string
+	if raw := strings.TrimSpace(values["ConnectedDevices"]); raw != "" {
+		for _, item := range strings.Split(raw, "|") {
+			item = strings.TrimSpace(item)
+			if item != "" {
+				devices = append(devices, item)
+			}
+		}
+	}
+
+	publicIP, _ := getPublicIP(false)
+	return Telemetry{
+		SSID:              values["SSID"],
+		SignalPercent:     signal,
+		WiFiLinkSpeed:     values["WiFiLinkSpeed"],
+		EthernetLinkSpeed: values["EthernetLinkSpeed"],
+		Gateway:           values["Gateway"],
+		DNS:               values["DNS"],
+		ConnectedDevices:  devices,
+		PublicIP:          publicIP,
+	}, nil
+}
+
+func getPublicIP(force bool) (string, error) {
+	publicIPMu.Lock()
+	if !force && publicIPCache != "" && time.Since(publicIPAt) < 5*time.Minute {
+		value := publicIPCache
+		publicIPMu.Unlock()
+		return value, nil
+	}
+	publicIPMu.Unlock()
+
+	client := &http.Client{Timeout: 4 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, "https://api.ipify.org", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", appName+"/"+currentVersion)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("public IP service returned %s", resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 128))
+	if err != nil {
+		return "", err
+	}
+	value := strings.TrimSpace(string(body))
+	if net.ParseIP(value) == nil {
+		return "", fmt.Errorf("public IP service returned invalid data")
+	}
+
+	publicIPMu.Lock()
+	publicIPCache = value
+	publicIPAt = time.Now()
+	publicIPMu.Unlock()
+	return value, nil
+}
+
+func testConnectivity(cfg Config) ConnectivityResult {
+	result := ConnectivityResult{}
+	h, err := health(cfg)
+	if err == nil {
+		result.RouteOK = h.WiFiHasDefaultRoute && strings.EqualFold(h.WiFiStatus, "Up")
+	}
+
+	if addrs, err := net.LookupHost("github.com"); err == nil && len(addrs) > 0 {
+		result.DNSOK = true
+		result.ResolvedHost = addrs[0]
+	}
+
+	client := &http.Client{Timeout: 6 * time.Second}
+	start := time.Now()
+	req, _ := http.NewRequest(http.MethodGet, "https://api.github.com/", nil)
+	req.Header.Set("User-Agent", appName+"/"+currentVersion)
+	if resp, err := client.Do(req); err == nil {
+		result.Latency = time.Since(start)
+		result.HTTPSOK = resp.StatusCode >= 200 && resp.StatusCode < 500
+		_ = resp.Body.Close()
+	}
+
+	if ip, err := getPublicIP(true); err == nil {
+		result.PublicIP = ip
+	}
+	return result
+}
+
+func connectivitySummary(r ConnectivityResult) string {
+	if r.RouteOK && r.DNSOK && r.HTTPSOK {
+		if r.Latency > 0 {
+			return fmt.Sprintf("All tests passed • HTTPS %d ms", r.Latency.Milliseconds())
+		}
+		return "All tests passed"
+	}
+
+	var failed []string
+	if !r.RouteOK {
+		failed = append(failed, "route")
+	}
+	if !r.DNSOK {
+		failed = append(failed, "DNS")
+	}
+	if !r.HTTPSOK {
+		failed = append(failed, "HTTPS")
+	}
+	return "Failed: " + strings.Join(failed, ", ")
+}
+
+func diagnosticReport(cfg Config, h Health, hErr error, t Telemetry, tErr error) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "WifiBirdger diagnostics\r\n")
+	fmt.Fprintf(&b, "Version: %s\r\n", currentVersion)
+	fmt.Fprintf(&b, "Generated: %s\r\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(&b, "Watchdog: %t\r\n", watcherRunning())
+	fmt.Fprintf(&b, "Start with Windows: %t\r\n", autoStartEnabled())
+	fmt.Fprintf(&b, "Auto detect: %t\r\n", cfg.AutoDetect)
+	fmt.Fprintf(&b, "Auto repair: %t\r\n", cfg.AutoRepair)
+	fmt.Fprintf(&b, "Auto update: %t\r\n", cfg.AutoUpdate)
+	fmt.Fprintf(&b, "\r\n")
+
+	if hErr != nil {
+		fmt.Fprintf(&b, "Health error: %s\r\n", hErr.Error())
+	} else {
+		fmt.Fprintf(&b, "Healthy: %t\r\n", h.Healthy)
+		fmt.Fprintf(&b, "Wi-Fi: %s | %s | %s\r\n", h.WiFiName, h.WiFiStatus, blankAs(h.WiFiIPv4, "no IPv4"))
+		fmt.Fprintf(&b, "Wi-Fi default route: %t\r\n", h.WiFiHasDefaultRoute)
+		fmt.Fprintf(&b, "Ethernet: %s | %s | %s\r\n", h.EthernetName, h.EthernetStatus, blankAs(h.EthernetIPv4, "no IPv4"))
+		fmt.Fprintf(&b, "ICS public: %t type=%d\r\n", h.PublicSharingEnabled, h.PublicSharingType)
+		fmt.Fprintf(&b, "ICS private: %t type=%d\r\n", h.PrivateSharingEnabled, h.PrivateSharingType)
+	}
+
+	if tErr != nil {
+		fmt.Fprintf(&b, "Telemetry error: %s\r\n", tErr.Error())
+	} else {
+		fmt.Fprintf(&b, "\r\nSSID: %s\r\n", blankAs(t.SSID, "unknown"))
+		fmt.Fprintf(&b, "Wi-Fi signal: %d%%\r\n", t.SignalPercent)
+		fmt.Fprintf(&b, "Wi-Fi link speed: %s\r\n", blankAs(t.WiFiLinkSpeed, "unknown"))
+		fmt.Fprintf(&b, "Ethernet link speed: %s\r\n", blankAs(t.EthernetLinkSpeed, "unknown"))
+		fmt.Fprintf(&b, "Gateway: %s\r\n", blankAs(t.Gateway, "unknown"))
+		fmt.Fprintf(&b, "DNS: %s\r\n", blankAs(t.DNS, "unknown"))
+		fmt.Fprintf(&b, "Public IP: %s\r\n", blankAs(t.PublicIP, "unknown"))
+		fmt.Fprintf(&b, "Connected Ethernet devices: %d\r\n", len(t.ConnectedDevices))
+		if len(t.ConnectedDevices) > 0 {
+			fmt.Fprintf(&b, "Device IPs: %s\r\n", strings.Join(t.ConnectedDevices, ", "))
+		}
+	}
+
+	fmt.Fprintf(&b, "\r\nConfig: %s\r\n", configPath())
+	fmt.Fprintf(&b, "Log: %s\r\n", logPath())
+	return b.String()
+}
+
+func copyTextToClipboard(text string) error {
+	cmd := exec.Command("clip.exe")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: CREATE_NO_WINDOW}
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run()
+}
+
+func openWithShell(target string) error {
+	r, _, _ := procShellExecute.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16("open"))),
+		uintptr(unsafe.Pointer(utf16(target))),
+		0,
+		0,
+		SW_SHOWNORMAL,
+	)
+	if r <= 32 {
+		return fmt.Errorf("Windows could not open %s", target)
+	}
+	return nil
+}
+
+func openLogFile() error {
+	ensureDir()
+	if _, err := os.Stat(logPath()); os.IsNotExist(err) {
+		_ = os.WriteFile(logPath(), nil, 0644)
+	}
+	return openWithShell(logPath())
+}
+
+func clearLogFile() error {
+	ensureDir()
+	return os.WriteFile(logPath(), nil, 0644)
 }
 
 func applyICS(cfg Config, force bool) error {
@@ -1030,7 +1343,7 @@ func watchdog() {
 			}
 		}
 		h, err := health(cfg)
-		if err != nil || !h.Healthy {
+		if cfg.AutoRepair && (err != nil || !h.Healthy) {
 			if time.Since(lastRepair) >= time.Duration(cfg.RepairCooldownSeconds)*time.Second {
 				if err != nil {
 					logLine("WARN", "Health check: "+err.Error())
@@ -1147,42 +1460,74 @@ func paintDashboard(hwnd syscall.Handle) {
 	}
 	defer procEndPaint.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps)))
 
-	bg := rgb(12, 17, 24)
-	card := rgb(20, 27, 37)
-	card2 := rgb(17, 24, 33)
-	border := rgb(42, 52, 65)
-	accent := rgb(73, 139, 255)
+	bg := rgb(10, 14, 20)
+	card := rgb(19, 26, 36)
+	card2 := rgb(15, 22, 31)
+	border := rgb(38, 48, 61)
+	accent := rgb(76, 139, 245)
 
 	bgBrush, _, _ := procCreateSolidBrush.Call(bg)
 	old, _, _ := procSelectObject.Call(hdc, bgBrush)
-	procRectangle.Call(hdc, 0, 0, 920, 760)
+	procRectangle.Call(hdc, 0, 0, 1040, 870)
 	procSelectObject.Call(hdc, old)
 	procDeleteObject.Call(bgBrush)
 
 	// Brand mark.
-	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 24, Right: 70, Bottom: 66}, accent, accent, 12)
+	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 30, Top: 24, Right: 72, Bottom: 66}, accent, accent, 13)
 	procSetBkMode.Call(hdc, TRANSPARENT)
 	procSetTextColor.Call(hdc, rgb(255, 255, 255))
 	oldFont, _, _ := procSelectObject.Call(hdc, uintptr(hFontSection))
 	logo := utf16("WB")
-	rcLogo := RECT{Left: 28, Top: 24, Right: 70, Bottom: 66}
+	rcLogo := RECT{Left: 30, Top: 24, Right: 72, Bottom: 66}
 	procDrawText.Call(hdc, uintptr(unsafe.Pointer(logo)), ^uintptr(0), uintptr(unsafe.Pointer(&rcLogo)), DT_CENTER|DT_VCENTER|DT_SINGLELINE)
 	procSelectObject.Call(hdc, oldFont)
 
 	// Main dashboard cards.
-	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 92, Right: 892, Bottom: 210}, card, border, 18)
-	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 240, Right: 892, Bottom: 404}, card2, border, 18)
-	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 434, Right: 892, Bottom: 544}, card2, border, 18)
-	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 574, Right: 892, Bottom: 716}, card2, border, 18)
+	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 92, Right: 1012, Bottom: 220}, card, border, 18)
+	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 240, Right: 680, Bottom: 468}, card2, border, 18)
+	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 700, Top: 240, Right: 1012, Bottom: 468}, card2, border, 18)
+	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 488, Right: 1012, Bottom: 590}, card2, border, 18)
+	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 610, Right: 1012, Bottom: 700}, card2, border, 18)
+	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 28, Top: 720, Right: 1012, Bottom: 828}, card2, border, 18)
 
-	// Metric dividers inside the health card.
-	pen, _, _ := procCreatePen.Call(PS_SOLID, 1, rgb(38, 48, 61))
+	// Health indicator.
+	healthColor := rgb(255, 186, 84)
+	if lastHealthErr != nil {
+		healthColor = rgb(244, 93, 106)
+	} else if lastHealth.Healthy {
+		healthColor = rgb(74, 202, 142)
+	}
+	drawRoundedPanel(syscall.Handle(hdc), RECT{Left: 52, Top: 119, Right: 64, Bottom: 131}, healthColor, healthColor, 6)
+
+	// Hero metric dividers.
+	pen, _, _ := procCreatePen.Call(PS_SOLID, 1, rgb(36, 46, 58))
 	oldPen, _, _ := procSelectObject.Call(hdc, pen)
-	procRectangle.Call(hdc, 502, 118, 503, 184)
-	procRectangle.Call(hdc, 627, 118, 628, 184)
-	procRectangle.Call(hdc, 752, 118, 753, 184)
+	procRectangle.Call(hdc, 585, 118, 586, 192)
+	procRectangle.Call(hdc, 727, 118, 728, 192)
+	procRectangle.Call(hdc, 869, 118, 870, 192)
 	procSelectObject.Call(hdc, oldPen)
 	procDeleteObject.Call(pen)
+
+	// Wi-Fi signal bars.
+	activeBars := 0
+	if lastTelemetry.SignalPercent > 0 {
+		activeBars = (lastTelemetry.SignalPercent + 19) / 20
+		if activeBars > 5 {
+			activeBars = 5
+		}
+	}
+	for i := 0; i < 5; i++ {
+		barColor := rgb(45, 55, 68)
+		if i < activeBars {
+			barColor = rgb(74, 202, 142)
+		}
+		height := int32(5 + i*4)
+		left := int32(943 + i*10)
+		drawRoundedPanel(syscall.Handle(hdc), RECT{
+			Left: left, Top: 326 + (22 - height),
+			Right: left + 6, Bottom: 348,
+		}, barColor, barColor, 3)
+	}
 }
 
 func drawModernButton(dis *DRAWITEMSTRUCT) {
@@ -1197,13 +1542,19 @@ func drawModernButton(dis *DRAWITEMSTRUCT) {
 	switch id {
 	case ID_START:
 		fill = rgb(61, 126, 240)
-		border = rgb(80, 145, 255)
+		border = rgb(84, 151, 255)
 	case ID_STOP:
-		fill = rgb(92, 38, 45)
-		border = rgb(132, 55, 66)
+		fill = rgb(91, 39, 47)
+		border = rgb(137, 57, 70)
+	case ID_TESTCONN:
+		fill = rgb(38, 111, 89)
+		border = rgb(55, 151, 120)
 	case ID_CHECKUPDATE:
-		fill = rgb(37, 83, 155)
-		border = rgb(53, 105, 190)
+		fill = rgb(66, 70, 155)
+		border = rgb(91, 96, 195)
+	case ID_REPAIR:
+		fill = rgb(55, 66, 82)
+		border = rgb(77, 91, 111)
 	}
 	if dis.ItemState&ODS_SELECTED != 0 {
 		fill = rgb(byte(fill&0xff)*4/5, byte((fill>>8)&0xff)*4/5, byte((fill>>16)&0xff)*4/5)
@@ -1278,8 +1629,14 @@ func setControlsEnabled(enabled bool) {
 	user32.NewProc("EnableWindow").Call(uintptr(hStop), v)
 	user32.NewProc("EnableWindow").Call(uintptr(hWiFi), v)
 	user32.NewProc("EnableWindow").Call(uintptr(hEthernet), v)
+	user32.NewProc("EnableWindow").Call(uintptr(hAutoRepair), v)
 	user32.NewProc("EnableWindow").Call(uintptr(hAutoUpdate), v)
 	user32.NewProc("EnableWindow").Call(uintptr(hCheckUpdate), v)
+	user32.NewProc("EnableWindow").Call(uintptr(hTestConn), v)
+	user32.NewProc("EnableWindow").Call(uintptr(hCopyDiag), v)
+	user32.NewProc("EnableWindow").Call(uintptr(hOpenSettings), v)
+	user32.NewProc("EnableWindow").Call(uintptr(hOpenLog), v)
+	user32.NewProc("EnableWindow").Call(uintptr(hClearLog), v)
 }
 
 func setWindowText(hwnd syscall.Handle, s string) {
@@ -1342,6 +1699,7 @@ func currentConfigFromUI() Config {
 		cfg.Ethernet = s
 	}
 	cfg.AutoDetect = checkState(hAutoDetect)
+	cfg.AutoRepair = checkState(hAutoRepair)
 	cfg.AutoUpdate = checkState(hAutoUpdate)
 	return cfg
 }
@@ -1363,6 +1721,7 @@ func refreshAdaptersAndStatus() {
 			}
 		}
 		h, herr := health(cfg)
+		t, terr := telemetry(cfg)
 		auto := autoStartEnabled()
 		postUI(func() {
 			if err == nil {
@@ -1371,8 +1730,10 @@ func refreshAdaptersAndStatus() {
 			}
 			setCheck(hAutoDetect, cfg.AutoDetect)
 			setCheck(hAutoStart, auto)
+			setCheck(hAutoRepair, cfg.AutoRepair)
 			setCheck(hAutoUpdate, cfg.AutoUpdate)
 			updateHealthUI(h, herr)
+			updateTelemetryUI(t, terr)
 		})
 	}()
 }
@@ -1459,6 +1820,80 @@ func autoCheckUpdateFromGUI() {
 	}()
 }
 
+func updateTelemetryUI(t Telemetry, err error) {
+	lastTelemetry = t
+	lastTelemetryErr = err
+	if err != nil {
+		setWindowText(hSSIDValue, "Unavailable")
+		setWindowText(hSignalValue, "—")
+		setWindowText(hWiFiSpeedValue, "—")
+		setWindowText(hEthSpeedValue, "—")
+		setWindowText(hDevicesValue, "—")
+		setWindowText(hPublicIPValue, "—")
+		setWindowText(hGatewayValue, "—")
+		invalidateDashboard()
+		return
+	}
+
+	signal := "Unknown"
+	if t.SignalPercent > 0 {
+		signal = fmt.Sprintf("%d%%", t.SignalPercent)
+	}
+	devices := fmt.Sprintf("%d connected", len(t.ConnectedDevices))
+	if len(t.ConnectedDevices) == 1 {
+		devices = "1 connected"
+	}
+	if len(t.ConnectedDevices) > 0 {
+		devices += " • " + t.ConnectedDevices[0]
+	}
+
+	setWindowText(hSSIDValue, blankAs(t.SSID, "Unknown network"))
+	setWindowText(hSignalValue, signal)
+	setWindowText(hWiFiSpeedValue, blankAs(t.WiFiLinkSpeed, "Unknown"))
+	setWindowText(hEthSpeedValue, blankAs(t.EthernetLinkSpeed, "Unknown"))
+	setWindowText(hDevicesValue, devices)
+	setWindowText(hPublicIPValue, blankAs(t.PublicIP, "Unavailable"))
+	setWindowText(hGatewayValue, blankAs(t.Gateway, "Unavailable"))
+	invalidateDashboard()
+}
+
+func testConnectionFromGUI() {
+	cfg := currentConfigFromUI()
+	_ = saveConfig(cfg)
+	setWindowText(hToolStatus, "Running route, DNS and HTTPS checks…")
+	setControlsEnabled(false)
+
+	go func() {
+		result := testConnectivity(cfg)
+		postUI(func() {
+			summary := connectivitySummary(result)
+			setWindowText(hToolStatus, summary)
+			if result.RouteOK && result.DNSOK && result.HTTPSOK {
+				logLine("INFO", "Connectivity test passed: "+summary)
+			} else {
+				logLine("WARN", "Connectivity test: "+summary)
+			}
+			if result.PublicIP != "" {
+				lastTelemetry.PublicIP = result.PublicIP
+				setWindowText(hPublicIPValue, result.PublicIP)
+			}
+			setControlsEnabled(true)
+		})
+	}()
+}
+
+func copyDiagnosticsFromGUI() {
+	cfg := currentConfigFromUI()
+	report := diagnosticReport(cfg, lastHealth, lastHealthErr, lastTelemetry, lastTelemetryErr)
+	if err := copyTextToClipboard(report); err != nil {
+		setWindowText(hToolStatus, "Could not copy diagnostics")
+		logLine("ERROR", "Copy diagnostics: "+err.Error())
+		return
+	}
+	setWindowText(hToolStatus, "Diagnostics copied to clipboard")
+	logLine("INFO", "Diagnostics copied to clipboard")
+}
+
 func updateHealthUI(h Health, err error) {
 	lastHealth = h
 	lastHealthErr = err
@@ -1474,18 +1909,28 @@ func updateHealthUI(h Health, err error) {
 
 	watch := "Watchdog off"
 	if watcherRunning() {
-		watch = "Watchdog active"
+		if loadConfig().AutoRepair {
+			watch = "Auto-repair active"
+		} else {
+			watch = "Monitoring only"
+		}
 	}
 
 	if h.Healthy {
 		setWindowText(hHealthTitle, "Connected & sharing")
-		setWindowText(hStatus, fmt.Sprintf("Internet is being shared from %s to %s • %s", h.WiFiName, h.EthernetName, watch))
+		setWindowText(hStatus, fmt.Sprintf("%s → %s is healthy • %s", h.WiFiName, h.EthernetName, watch))
+	} else if !strings.EqualFold(h.WiFiStatus, "Up") {
+		setWindowText(hHealthTitle, "Wi-Fi is offline")
+		setWindowText(hStatus, fmt.Sprintf("Connect %s to the internet, then WifiBirdger will continue automatically • %s", h.WiFiName, watch))
 	} else if strings.EqualFold(h.WiFiStatus, "Up") && !strings.EqualFold(h.EthernetStatus, "Up") {
 		setWindowText(hHealthTitle, "Waiting for Ethernet")
-		setWindowText(hStatus, fmt.Sprintf("Wi-Fi is ready. Connect the Ethernet cable to continue • %s", watch))
+		setWindowText(hStatus, fmt.Sprintf("Wi-Fi is ready. Connect the Ethernet cable to %s • %s", h.EthernetName, watch))
+	} else if !h.PublicSharingEnabled || !h.PrivateSharingEnabled {
+		setWindowText(hHealthTitle, "Sharing is not active")
+		setWindowText(hStatus, fmt.Sprintf("Adapters are ready. Click Start sharing or Repair • %s", watch))
 	} else {
 		setWindowText(hHealthTitle, "Needs attention")
-		setWindowText(hStatus, fmt.Sprintf("Sharing is not fully healthy yet • %s", watch))
+		setWindowText(hStatus, fmt.Sprintf("ICS is configured but the route is not fully healthy • %s", watch))
 	}
 
 	wifiText := h.WiFiStatus
@@ -1526,93 +1971,140 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		hwndMain = hwnd
 		enableDarkTitleBar(hwnd)
 
-		// Typography is created once and reused by all controls.
-		hFontTitle = makeFont(-26, FW_BOLD, "Segoe UI")
-		hFontHero = makeFont(-23, FW_SEMIBOLD, "Segoe UI")
+		hFontTitle = makeFont(-27, FW_BOLD, "Segoe UI")
+		hFontHero = makeFont(-24, FW_SEMIBOLD, "Segoe UI")
 		hFontSection = makeFont(-16, FW_SEMIBOLD, "Segoe UI")
 		hFontBody = makeFont(-15, FW_NORMAL, "Segoe UI")
 		hFontSmall = makeFont(-13, FW_NORMAL, "Segoe UI")
-		hFontMono = makeFont(-13, FW_NORMAL, "Cascadia Mono")
+		hFontMono = makeFont(-12, FW_NORMAL, "Cascadia Mono")
 
 		// Header.
-		title := createControl("STATIC", "WifiBirdger", WS_CHILD|WS_VISIBLE, 84, 20, 330, 32, 0)
+		title := createControl("STATIC", "WifiBirdger", WS_CHILD|WS_VISIBLE, 86, 20, 350, 32, 0)
 		applyFont(title, hFontTitle)
-		hSubtitle = createControl("STATIC", "Fast, self-healing Wi-Fi → Ethernet sharing", WS_CHILD|WS_VISIBLE, 85, 52, 520, 20, 0)
+		hSubtitle = createControl("STATIC", "Internet sharing that monitors and repairs itself", WS_CHILD|WS_VISIBLE, 87, 52, 560, 20, 0)
 		applyFont(hSubtitle, hFontSmall)
-		hVersion = createControl("STATIC", fmt.Sprintf("v%s", currentVersion), WS_CHILD|WS_VISIBLE, 810, 31, 60, 22, 0)
+		hVersion = createControl("STATIC", fmt.Sprintf("v%s", currentVersion), WS_CHILD|WS_VISIBLE, 930, 31, 62, 22, 0)
 		applyFont(hVersion, hFontSmall)
 
-		// Health hero card.
-		hHealthTitle = createControl("STATIC", "Checking connection…", WS_CHILD|WS_VISIBLE, 52, 116, 420, 30, 0)
+		// Hero health card.
+		hHealthTitle = createControl("STATIC", "Checking connection…", WS_CHILD|WS_VISIBLE, 76, 112, 470, 32, 0)
 		applyFont(hHealthTitle, hFontHero)
-		hStatus = createControl("STATIC", "Reading network state…", WS_CHILD|WS_VISIBLE, 52, 151, 420, 42, ID_STATUS)
+		hStatus = createControl("STATIC", "Reading Windows network state…", WS_CHILD|WS_VISIBLE, 76, 151, 475, 44, ID_STATUS)
 		applyFont(hStatus, hFontSmall)
 
-		metricLabel1 := createControl("STATIC", "WI-FI", WS_CHILD|WS_VISIBLE, 522, 118, 88, 18, 0)
-		metricLabel2 := createControl("STATIC", "ETHERNET", WS_CHILD|WS_VISIBLE, 647, 118, 92, 18, 0)
-		metricLabel3 := createControl("STATIC", "SHARING", WS_CHILD|WS_VISIBLE, 772, 118, 90, 18, 0)
+		metricLabel1 := createControl("STATIC", "WI-FI", WS_CHILD|WS_VISIBLE, 608, 117, 92, 18, 0)
+		metricLabel2 := createControl("STATIC", "ETHERNET", WS_CHILD|WS_VISIBLE, 750, 117, 96, 18, 0)
+		metricLabel3 := createControl("STATIC", "SHARING", WS_CHILD|WS_VISIBLE, 892, 117, 92, 18, 0)
 		applyFont(metricLabel1, hFontSmall)
 		applyFont(metricLabel2, hFontSmall)
 		applyFont(metricLabel3, hFontSmall)
-		hWiFiMetric = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 522, 143, 94, 45, 0)
-		hEthernetMetric = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 647, 143, 94, 45, 0)
-		hShareMetric = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 772, 143, 94, 45, 0)
+		hWiFiMetric = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 608, 143, 106, 48, 0)
+		hEthernetMetric = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 750, 143, 106, 48, 0)
+		hShareMetric = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 892, 143, 100, 48, 0)
 		applyFont(hWiFiMetric, hFontSection)
 		applyFont(hEthernetMetric, hFontSection)
 		applyFont(hShareMetric, hFontSection)
 
-		// Network card.
-		hSectionNetwork = createControl("STATIC", "Network", WS_CHILD|WS_VISIBLE, 52, 258, 220, 24, 0)
+		// Connection card.
+		hSectionNetwork = createControl("STATIC", "Connection", WS_CHILD|WS_VISIBLE, 52, 258, 220, 24, 0)
 		applyFont(hSectionNetwork, hFontSection)
-		wifiLabel := createControl("STATIC", "Internet source", WS_CHILD|WS_VISIBLE, 52, 292, 180, 20, 0)
-		ethLabel := createControl("STATIC", "Share to", WS_CHILD|WS_VISIBLE, 466, 292, 180, 20, 0)
+		wifiLabel := createControl("STATIC", "Internet source", WS_CHILD|WS_VISIBLE, 52, 292, 160, 18, 0)
+		ethLabel := createControl("STATIC", "Share internet to", WS_CHILD|WS_VISIBLE, 366, 292, 180, 18, 0)
 		applyFont(wifiLabel, hFontSmall)
 		applyFont(ethLabel, hFontSmall)
-		hWiFi = createControl("COMBOBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST, 52, 315, 360, 180, ID_WIFI)
-		hEthernet = createControl("COMBOBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST, 466, 315, 360, 180, ID_ETHERNET)
+
+		hWiFi = createControl("COMBOBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST, 52, 314, 280, 180, ID_WIFI)
+		hEthernet = createControl("COMBOBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST, 366, 314, 280, 180, ID_ETHERNET)
 		applyFont(hWiFi, hFontBody)
 		applyFont(hEthernet, hFontBody)
 		darkTheme(hWiFi)
 		darkTheme(hEthernet)
 
-		hAutoDetect = createControl("BUTTON", "Auto-detect adapters", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX|BS_FLAT, 52, 358, 190, 24, ID_AUTODETECT)
-		hAutoStart = createControl("BUTTON", "Start with Windows", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX|BS_FLAT, 255, 358, 180, 24, ID_AUTOSTART)
+		hAutoDetect = createControl("BUTTON", "Auto-detect adapters", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX|BS_FLAT, 52, 357, 175, 24, ID_AUTODETECT)
+		hAutoStart = createControl("BUTTON", "Start with Windows", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX|BS_FLAT, 237, 357, 158, 24, ID_AUTOSTART)
+		hAutoRepair = createControl("BUTTON", "Auto-repair", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX|BS_FLAT, 405, 357, 125, 24, ID_AUTOREPAIR)
 		applyFont(hAutoDetect, hFontSmall)
 		applyFont(hAutoStart, hFontSmall)
+		applyFont(hAutoRepair, hFontSmall)
 
-		hRefresh = createControl("BUTTON", "Refresh", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 466, 352, 100, 34, ID_REFRESH)
-		hRepair = createControl("BUTTON", "Repair", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 576, 352, 100, 34, ID_REPAIR)
-		hStop = createControl("BUTTON", "Stop", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 686, 352, 76, 34, ID_STOP)
-		hStart = createControl("BUTTON", "Start sharing", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 772, 352, 96, 34, ID_START)
-		applyFont(hRefresh, hFontBody)
-		applyFont(hRepair, hFontBody)
-		applyFont(hStop, hFontBody)
-		applyFont(hStart, hFontBody)
+		hRefresh = createControl("BUTTON", "Refresh", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 52, 401, 102, 38, ID_REFRESH)
+		hRepair = createControl("BUTTON", "Repair", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 164, 401, 102, 38, ID_REPAIR)
+		hStop = createControl("BUTTON", "Stop", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 276, 401, 102, 38, ID_STOP)
+		hStart = createControl("BUTTON", "Start sharing", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 388, 401, 258, 38, ID_START)
+		for _, h := range []syscall.Handle{hRefresh, hRepair, hStop, hStart} {
+			applyFont(h, hFontBody)
+		}
+
+		// Live details card.
+		hSectionDetails = createControl("STATIC", "Live details", WS_CHILD|WS_VISIBLE, 724, 258, 220, 24, 0)
+		applyFont(hSectionDetails, hFontSection)
+
+		detailLabels := []struct {
+			text string
+			y    int32
+		}{
+			{"Wi-Fi network", 292},
+			{"Signal", 320},
+			{"Wi-Fi link", 348},
+			{"Ethernet link", 376},
+			{"PC / devices", 404},
+			{"Public IP", 432},
+		}
+		for _, item := range detailLabels {
+			h := createControl("STATIC", item.text, WS_CHILD|WS_VISIBLE, 724, item.y, 102, 18, 0)
+			applyFont(h, hFontSmall)
+		}
+
+		hSSIDValue = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 830, 292, 154, 18, 0)
+		hSignalValue = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 830, 320, 88, 18, 0)
+		hWiFiSpeedValue = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 830, 348, 154, 18, 0)
+		hEthSpeedValue = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 830, 376, 154, 18, 0)
+		hDevicesValue = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 830, 404, 154, 18, 0)
+		hPublicIPValue = createControl("STATIC", "—", WS_CHILD|WS_VISIBLE, 830, 432, 154, 18, 0)
+		for _, h := range []syscall.Handle{hSSIDValue, hSignalValue, hWiFiSpeedValue, hEthSpeedValue, hDevicesValue, hPublicIPValue} {
+			applyFont(h, hFontSmall)
+		}
+		hGatewayValue = createControl("STATIC", "", WS_CHILD, 0, 0, 0, 0, 0)
+
+		// Tools card.
+		hSectionTools = createControl("STATIC", "Tools", WS_CHILD|WS_VISIBLE, 52, 505, 110, 22, 0)
+		applyFont(hSectionTools, hFontSection)
+		hToolStatus = createControl("STATIC", "Ready", WS_CHILD|WS_VISIBLE, 150, 507, 820, 20, ID_TOOLSTATUS)
+		applyFont(hToolStatus, hFontSmall)
+
+		hTestConn = createControl("BUTTON", "Test connection", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 52, 540, 164, 36, ID_TESTCONN)
+		hCopyDiag = createControl("BUTTON", "Copy diagnostics", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 226, 540, 164, 36, ID_COPYDIAG)
+		hOpenSettings = createControl("BUTTON", "Network settings", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 400, 540, 174, 36, ID_OPENSETTINGS)
+		hOpenLog = createControl("BUTTON", "Open log", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 584, 540, 132, 36, ID_OPENLOG)
+		hClearLog = createControl("BUTTON", "Clear log", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 726, 540, 132, 36, ID_CLEARLOG)
+		for _, h := range []syscall.Handle{hTestConn, hCopyDiag, hOpenSettings, hOpenLog, hClearLog} {
+			applyFont(h, hFontBody)
+		}
 
 		// Updates card.
-		hSectionUpdates = createControl("STATIC", "Updates", WS_CHILD|WS_VISIBLE, 52, 452, 150, 22, 0)
+		hSectionUpdates = createControl("STATIC", "Updates", WS_CHILD|WS_VISIBLE, 52, 627, 120, 22, 0)
 		applyFont(hSectionUpdates, hFontSection)
-		updateSource := createControl("STATIC", fmt.Sprintf("GitHub • %s", githubRepo), WS_CHILD|WS_VISIBLE, 52, 480, 300, 20, 0)
+		updateSource := createControl("STATIC", fmt.Sprintf("GitHub • %s", githubRepo), WS_CHILD|WS_VISIBLE, 150, 629, 300, 20, 0)
 		applyFont(updateSource, hFontSmall)
-		hUpdateStatus = createControl("STATIC", fmt.Sprintf("v%s • checking…", currentVersion), WS_CHILD|WS_VISIBLE, 355, 480, 285, 20, ID_UPDATESTATUS)
+		hUpdateStatus = createControl("STATIC", fmt.Sprintf("v%s • checking…", currentVersion), WS_CHILD|WS_VISIBLE, 460, 629, 335, 20, ID_UPDATESTATUS)
 		applyFont(hUpdateStatus, hFontSmall)
-		hAutoUpdate = createControl("BUTTON", "Install updates automatically", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX|BS_FLAT, 52, 510, 235, 24, ID_AUTOUPDATE)
+		hAutoUpdate = createControl("BUTTON", "Install updates automatically", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX|BS_FLAT, 52, 663, 235, 24, ID_AUTOUPDATE)
 		applyFont(hAutoUpdate, hFontSmall)
-		hCheckUpdate = createControl("BUTTON", "Check for update", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 704, 484, 164, 38, ID_CHECKUPDATE)
+		hCheckUpdate = createControl("BUTTON", "Check for update", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW, 826, 646, 164, 38, ID_CHECKUPDATE)
 		applyFont(hCheckUpdate, hFontBody)
 
-		// Log card.
-		hSectionLog = createControl("STATIC", "Activity", WS_CHILD|WS_VISIBLE, 52, 593, 150, 22, 0)
+		// Activity card.
+		hSectionLog = createControl("STATIC", "Activity", WS_CHILD|WS_VISIBLE, 52, 738, 120, 22, 0)
 		applyFont(hSectionLog, hFontSection)
-		hLog = createControl("EDIT", "", WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_LEFT|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY, 52, 624, 816, 70, ID_LOG)
+		hLog = createControl("EDIT", "", WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_LEFT|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY, 52, 766, 938, 60, ID_LOG)
 		applyFont(hLog, hFontMono)
 		darkTheme(hLog)
 
-		darkBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(rgb(12, 17, 24))))
-		editBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(rgb(15, 21, 29))))
-		cardBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(rgb(20, 27, 37))))
-		softBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(rgb(17, 24, 33))))
-		borderPen = syscall.Handle(mustCall(procCreatePen.Call(PS_SOLID, 1, rgb(42, 52, 65))))
+		darkBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(rgb(10, 14, 20))))
+		editBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(rgb(13, 19, 27))))
+		cardBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(rgb(19, 26, 36))))
+		softBrush = syscall.Handle(mustCall(procCreateSolidBrush.Call(rgb(15, 22, 31))))
+		borderPen = syscall.Handle(mustCall(procCreatePen.Call(PS_SOLID, 1, rgb(38, 48, 61))))
 
 		procSetTimer.Call(uintptr(hwnd), 1, 10000, 0)
 		refreshAdaptersAndStatus()
@@ -1644,6 +2136,14 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 				cfg := currentConfigFromUI()
 				_ = saveConfig(cfg)
 				refreshAdaptersAndStatus()
+			case ID_AUTOREPAIR:
+				cfg := currentConfigFromUI()
+				_ = saveConfig(cfg)
+				if cfg.AutoRepair {
+					setWindowText(hToolStatus, "Auto-repair enabled")
+				} else {
+					setWindowText(hToolStatus, "Auto-repair disabled • watchdog will monitor only")
+				}
 			case ID_AUTOSTART:
 				want := checkState(hAutoStart)
 				cfg := currentConfigFromUI()
@@ -1657,6 +2157,32 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 				}
 			case ID_CHECKUPDATE:
 				checkUpdateFromGUI()
+			case ID_TESTCONN:
+				testConnectionFromGUI()
+			case ID_COPYDIAG:
+				copyDiagnosticsFromGUI()
+			case ID_OPENSETTINGS:
+				if err := openWithShell("ms-settings:network-status"); err != nil {
+					setWindowText(hToolStatus, "Could not open Windows network settings")
+					logLine("ERROR", "Open network settings: "+err.Error())
+				} else {
+					setWindowText(hToolStatus, "Opened Windows network settings")
+				}
+			case ID_OPENLOG:
+				if err := openLogFile(); err != nil {
+					setWindowText(hToolStatus, "Could not open log")
+					logLine("ERROR", "Open log: "+err.Error())
+				} else {
+					setWindowText(hToolStatus, "Opened activity log")
+				}
+			case ID_CLEARLOG:
+				if err := clearLogFile(); err != nil {
+					setWindowText(hToolStatus, "Could not clear log")
+					logLine("ERROR", "Clear log: "+err.Error())
+				} else {
+					setWindowText(hLog, "")
+					setWindowText(hToolStatus, "Activity log cleared")
+				}
 			case ID_START:
 				cfg := currentConfigFromUI()
 				_ = saveConfig(cfg)
@@ -1695,7 +2221,7 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		procSetBkMode.Call(wParam, TRANSPARENT)
 		color := rgb(222, 229, 238)
 		h := syscall.Handle(lParam)
-		if h == hSubtitle || h == hVersion || h == hStatus || h == hUpdateStatus {
+		if h == hSubtitle || h == hVersion || h == hStatus || h == hUpdateStatus || h == hToolStatus {
 			color = rgb(137, 151, 169)
 		}
 		if h == hHealthTitle {
@@ -1752,7 +2278,7 @@ func runGUI() {
 		return
 	}
 	style := uint32(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX)
-	hwnd, _, _ := procCreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(utf16("WifiBirdger"))), uintptr(style), CW_USEDEFAULT, CW_USEDEFAULT, 920, 760, 0, 0, hInst, 0)
+	hwnd, _, _ := procCreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(utf16("WifiBirdger"))), uintptr(style), CW_USEDEFAULT, CW_USEDEFAULT, 1040, 890, 0, 0, hInst, 0)
 	if hwnd == 0 {
 		return
 	}
